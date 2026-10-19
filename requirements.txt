@@ -2,3 +2,4 @@ requests>=2.31
 python-dotenv>=1.0
 # O Python que vem no Mac (3.9) usa LibreSSL; urllib3 2.x reclama dele com um aviso.
 urllib3<2; python_version < "3.10"
+pywebpush>=2.0

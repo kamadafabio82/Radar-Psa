@@ -97,6 +97,10 @@ SUPABASE_URL = env("SUPABASE_URL").rstrip("/")
 SUPABASE_SERVICE_KEY = env("SUPABASE_SERVICE_KEY")  # chave "service_role": secreta, só no .env
 LINK_APP = env("LINK_APP")  # endereço do app no Lovable, vira botão no Telegram
 
+# Notificação na tela de bloqueio do iPhone (Web Push do app instalado).
+VAPID_PRIVATE_KEY = env("VAPID_PRIVATE_KEY")  # secreta, só no .env / cofre do GitHub
+VAPID_SUBJECT = env("VAPID_SUBJECT", "mailto:radar@example.com")
+
 ARQUIVO_VISTOS = Path(env("ARQUIVO_VISTOS", str(Path(__file__).with_name("vistos.json"))))
 # Histórico dos alertas; a página com fotos é salva ao lado, em alertas.html.
 ARQUIVO_ALERTAS = Path(env("ARQUIVO_ALERTAS", str(Path(__file__).with_name("alertas.json"))))
@@ -900,6 +904,55 @@ def enviar_app(oportunidades: list[Anuncio]) -> bool:
     return r.ok
 
 
+def enviar_push(oportunidades: list[Anuncio]) -> bool:
+    """Notificação do app Radar PSA na tela de bloqueio (para cada iPhone inscrito)."""
+    if not (VAPID_PRIVATE_KEY and SUPABASE_URL and SUPABASE_SERVICE_KEY and oportunidades):
+        return False
+    try:
+        from pywebpush import WebPushException, webpush
+    except ImportError:
+        print("  Notificação do app: falta instalar pywebpush (pip install -r requirements.txt)")
+        return False
+    cab = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/push_inscricoes",
+                         params={"select": "id,endpoint,p256dh,auth"}, headers=cab, timeout=30)
+        r.raise_for_status()
+        inscricoes = r.json()
+    except Exception as e:  # noqa: BLE001
+        print(f"  Notificação do app falhou ao ler inscrições: {e}")
+        return False
+    if not inscricoes:
+        return False
+    melhor = max(oportunidades, key=lambda x: x.desconto_pct)
+    if len(oportunidades) == 1:
+        titulo = f"{ICONE_VEREDITO[veredito(melhor)]} {melhor.desconto_pct:.0f}% abaixo · PSA {melhor.nota}"
+        corpo = f"{melhor.titulo[:90]} · {usd(melhor.custo_total)} (mercado {usd(melhor.mercado)})"
+    else:
+        titulo = f"🔔 {len(oportunidades)} cartas novas no Radar PSA"
+        corpo = f"Melhor: {melhor.titulo[:70]} · {melhor.desconto_pct:.0f}% abaixo"
+    payload = json.dumps({"title": titulo, "body": corpo, "url": LINK_APP or "/",
+                          "tag": f"radar-{melhor.item_id}"}, ensure_ascii=False)
+    ok = False
+    for ins in inscricoes:
+        try:
+            webpush(subscription_info={"endpoint": ins["endpoint"],
+                                       "keys": {"p256dh": ins["p256dh"], "auth": ins["auth"]}},
+                    data=payload, vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={"sub": VAPID_SUBJECT}, ttl=3600)
+            ok = True
+        except WebPushException as e:
+            status = getattr(e.response, "status_code", None)
+            if status in (404, 410):  # inscrição expirada: remove
+                requests.delete(f"{SUPABASE_URL}/rest/v1/push_inscricoes",
+                                params={"id": f"eq.{ins['id']}"}, headers=cab, timeout=30)
+            else:
+                print(f"  Notificação do app falhou: {e}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  Notificação do app falhou: {e}")
+    return ok
+
+
 def notificar(oportunidades: list[Anuncio]) -> None:
     if not oportunidades:
         return
@@ -912,6 +965,7 @@ def notificar(oportunidades: list[Anuncio]) -> None:
 
     pagina = salvar_pagina(oportunidades)
     enviado = enviar_app(oportunidades)
+    enviado |= enviar_push(oportunidades)
     if TELEGRAM_BOT_TOKEN:
         aviso = f"🔔 <b>{html.escape(resumo)}</b>"
         if link_seguro(LINK_APP):
