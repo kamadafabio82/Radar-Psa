@@ -11,7 +11,8 @@ O que ele faz a cada execução:
   4. Calcula o preço de mercado da MESMA carta na MESMA nota:
        - pelo PriceCharting (vendas concluídas), se você tiver o token; ou
        - pela mediana dos outros anúncios ativos da mesma carta/nota no eBay.
-  5. Se o anúncio estiver X% (padrão 30%) abaixo do mercado, manda alerta
+  5. Dá uma nota de 0 a 100 ao vendedor (veja "CRITÉRIO DO VENDEDOR").
+  6. Se o anúncio estiver X% (padrão 30%) abaixo do mercado, manda alerta
      no Telegram e/ou e-mail. Opcionalmente o Claude escreve uma análise curta.
 
 Nunca compra, nunca dá lance. Só avisa.
@@ -123,6 +124,60 @@ BUSCAS = [
 
 CATEGORIA_CARTAS = "183454"  # eBay: CCG Individual Cards
 
+# ===========================================================================
+# CRITÉRIO DO VENDEDOR  <-- é aqui que você ajusta a confiabilidade
+# ===========================================================================
+# O vendedor ganha uma nota de 0 a 100, somando 4 partes.
+# Conta nova NÃO é punida sozinha: quando um dado não vem do eBay (ou é pouco
+# para julgar), o vendedor ganha METADE dos pontos daquela parte.
+
+PONTOS_AVALIACOES = 35   # quantidade de avaliações que o vendedor tem
+PONTOS_POSITIVAS = 40    # % de avaliações positivas
+PONTOS_TOP_RATED = 15    # selo "Top Rated" (vendedor destaque) do eBay
+PONTOS_PAIS = 10         # de onde o vendedor envia
+
+# Quantidade de avaliações -> fração dos PONTOS_AVALIACOES.
+# Leia assim: "a partir de 1000 avaliações ganha 100%", "a partir de 200 ganha 85%"...
+FAIXAS_AVALIACOES = [(1000, 1.0), (200, 0.85), (50, 0.65), (10, 0.5), (1, 0.4), (0, 0.2)]
+
+# % de positivas -> fração dos PONTOS_POSITIVAS.
+FAIXAS_POSITIVAS = [(99.5, 1.0), (99.0, 0.9), (98.0, 0.75), (97.0, 0.55), (95.0, 0.3), (0, 0.05)]
+
+# Com menos avaliações que isto, a % de positivas quase não diz nada
+# (uma única avaliação ruim derruba tudo), então vale metade dos pontos.
+MIN_AVALIACOES_PARA_PCT = 10
+
+# Países que ganham os pontos cheios; os outros ganham metade.
+PAISES_CONFIAVEIS = ["US", "BR"]
+
+# Nota mínima de cada nível.
+NOTA_CONSOLIDADO = 85
+NOTA_CONFIAVEL = 70
+NOTA_REGULAR = 50        # entre 50 e 69: "novo" ou "regular", com ou sem garantia
+NOTA_FRACO = 30          # entre 30 e 49: sinais fracos; abaixo de 30: risco
+
+# Abaixo disto de avaliações o vendedor é chamado de "novo".
+AVALIACOES_VENDEDOR_NOVO = 50
+
+# SINAIS GRAVES: qualquer um leva direto a "Vendedor de risco", qualquer que seja a nota.
+PCT_GRAVE = 95.0                  # % de positivas abaixo disto...
+AVALIACOES_PARA_PCT_GRAVE = 20    # ...com pelo menos isto de avaliações (é padrão, não azar)
+DESCONTO_SUSPEITO = 60.0          # desconto que, numa conta quase sem histórico e sem garantia, é sinal grave
+
+# Garantia de Autenticidade do eBay (a PSA inspeciona o slab antes do envio).
+# Vale para cartas a partir deste valor, compradas e entregues nos EUA.
+GARANTIA_VALOR_MINIMO = 200.0
+
+# Nomes dos níveis (aparecem no Telegram, no e-mail e no app).
+NIVEL_CONSOLIDADO = "Vendedor consolidado"
+NIVEL_CONFIAVEL = "Vendedor confiável"
+NIVEL_NOVO_PROTEGIDO = "Vendedor novo, compra protegida"
+NIVEL_NOVO = "Vendedor novo, sem histórico suficiente"
+NIVEL_REGULAR_PROTEGIDO = "Vendedor regular, compra protegida"
+NIVEL_REGULAR = "Vendedor regular, sem garantia extra"
+NIVEL_FRACO = "Vendedor com sinais fracos"
+NIVEL_RISCO = "Vendedor de risco"
+
 # ---------------------------------------------------------------------------
 # Regras de filtragem e sinais de valorização
 # ---------------------------------------------------------------------------
@@ -191,6 +246,8 @@ class Anuncio:
     feedback_pct: float | None = None
     feedback_score: int | None = None
     imagem: str = ""
+    top_rated: bool | None = None          # selo "Top Rated" do eBay (None = eBay não informou)
+    garantia_confirmada: bool = False      # o eBay informou Garantia de Autenticidade no anúncio
     # calculados
     nota: int | None = None
     chave_carta: str = ""
@@ -204,6 +261,10 @@ class Anuncio:
     custo_brasil_usd: float = 0.0
     alertas: list[str] = field(default_factory=list)
     analise_claude: str = ""
+    nota_vendedor: int = 0
+    nivel_vendedor: str = ""
+    motivos_vendedor: list[str] = field(default_factory=list)
+    garantia: str = ""                     # "confirmada", "provável" ou ""
 
     @property
     def custo_total(self) -> float:
@@ -380,6 +441,8 @@ class Ebay:
                 break
         vendedor = i.get("seller", {}) or {}
         pct = vendedor.get("feedbackPercentage")
+        top = i.get("topRatedBuyingExperience")
+        programas = " ".join(str(p) for p in (i.get("qualifiedPrograms") or [])).upper()
         return Anuncio(
             item_id=i["itemId"],
             titulo=i.get("title", ""),
@@ -392,6 +455,8 @@ class Ebay:
             feedback_pct=float(pct) if pct else None,
             feedback_score=vendedor.get("feedbackScore"),
             imagem=(i.get("image") or {}).get("imageUrl", ""),
+            top_rated=top if isinstance(top, bool) else None,
+            garantia_confirmada="AUTHENTICITY" in programas,
         )
 
 
@@ -453,6 +518,104 @@ def mercado_comparaveis(a: Anuncio, ebay: Ebay, cache: dict) -> tuple[float | No
 
 
 # ---------------------------------------------------------------------------
+# Confiabilidade do vendedor (as regras ficam em "CRITÉRIO DO VENDEDOR", lá em cima)
+# ---------------------------------------------------------------------------
+
+NIVEIS_ARRISCADOS = (NIVEL_RISCO, NIVEL_FRACO, NIVEL_NOVO)
+
+
+def _fracao(valor: float, faixas: list[tuple[float, float]]) -> float:
+    for minimo, fracao in faixas:
+        if valor >= minimo:
+            return fracao
+    return faixas[-1][1]
+
+
+def checar_garantia(a: Anuncio) -> str:
+    """'confirmada' se o eBay informou, 'provável' se a carta se encaixa nas regras, '' se não."""
+    if a.garantia_confirmada:
+        return "confirmada"
+    if a.preco >= GARANTIA_VALOR_MINIMO and a.pais_vendedor == "US" and EBAY_MARKETPLACE == "EBAY_US":
+        return "provável"
+    return ""
+
+
+def avaliar_vendedor(a: Anuncio) -> None:
+    """Dá nota de 0 a 100 ao vendedor, escolhe o nível e anota os motivos."""
+    n, pct = a.feedback_score, a.feedback_pct
+    pontos = 0.0
+    motivos: list[str] = []
+
+    # 1. Quantidade de avaliações
+    if n is None:
+        pontos += PONTOS_AVALIACOES * 0.5
+        motivos.append("quantidade de avaliações não informada")
+    else:
+        pontos += PONTOS_AVALIACOES * _fracao(n, FAIXAS_AVALIACOES)
+        motivos.append(f"{n} avaliações")
+
+    # 2. % de positivas (com poucas avaliações vale metade, sem punir)
+    if pct is None:
+        pontos += PONTOS_POSITIVAS * 0.5
+        motivos.append("% de positivas não informada")
+    elif n is not None and n < MIN_AVALIACOES_PARA_PCT:
+        pontos += PONTOS_POSITIVAS * 0.5
+        motivos.append(f"{pct:.1f}% positivas, mas com poucas avaliações para julgar")
+    else:
+        pontos += PONTOS_POSITIVAS * _fracao(pct, FAIXAS_POSITIVAS)
+        motivos.append(f"{pct:.1f}% positivas")
+
+    # 3. Selo Top Rated
+    if a.top_rated is True:
+        pontos += PONTOS_TOP_RATED
+        motivos.append("selo Top Rated do eBay")
+    elif a.top_rated is None:
+        pontos += PONTOS_TOP_RATED * 0.5
+
+    # 4. País de envio
+    if not a.pais_vendedor:
+        pontos += PONTOS_PAIS * 0.5
+    elif a.pais_vendedor in PAISES_CONFIAVEIS:
+        pontos += PONTOS_PAIS
+    else:
+        pontos += PONTOS_PAIS * 0.5
+        motivos.append(f"envia de {a.pais_vendedor}")
+
+    a.garantia = checar_garantia(a)
+    if a.garantia == "confirmada":
+        motivos.append("tem Garantia de Autenticidade do eBay")
+    elif a.garantia == "provável":
+        motivos.append("provável Garantia de Autenticidade (só com entrega nos EUA; confira o selo azul)")
+
+    # Sinais graves
+    graves = []
+    if pct is not None and n is not None and n >= AVALIACOES_PARA_PCT_GRAVE and pct < PCT_GRAVE:
+        graves.append(f"só {pct:.1f}% de positivas em {n} avaliações")
+    if a.desconto_pct >= DESCONTO_SUSPEITO and (n or 0) < MIN_AVALIACOES_PARA_PCT and not a.garantia:
+        graves.append("conta quase sem histórico com preço muito abaixo do mercado e sem garantia")
+
+    nota = round(pontos)
+    novo = n is None or n < AVALIACOES_VENDEDOR_NOVO
+    if graves or nota < NOTA_FRACO:
+        nivel = NIVEL_RISCO
+    elif nota >= NOTA_CONSOLIDADO:
+        nivel = NIVEL_CONSOLIDADO
+    elif nota >= NOTA_CONFIAVEL:
+        nivel = NIVEL_CONFIAVEL
+    elif nota >= NOTA_REGULAR:
+        if novo:
+            nivel = NIVEL_NOVO_PROTEGIDO if a.garantia else NIVEL_NOVO
+        else:
+            nivel = NIVEL_REGULAR_PROTEGIDO if a.garantia else NIVEL_REGULAR
+    else:
+        nivel = NIVEL_FRACO
+
+    a.nota_vendedor = nota
+    a.nivel_vendedor = nivel
+    a.motivos_vendedor = graves + motivos
+
+
+# ---------------------------------------------------------------------------
 # Avaliação da oportunidade
 # ---------------------------------------------------------------------------
 
@@ -463,11 +626,9 @@ def avaliar(a: Anuncio) -> None:
     imposto = IMPOSTO_IMPORTACAO if a.pais_vendedor != "BR" else 0
     a.custo_brasil_usd = (a.custo_total + frete_br) * (1 + imposto)
 
-    if a.feedback_score is not None and a.feedback_score < 50:
-        a.alertas.append(f"vendedor com pouco histórico ({a.feedback_score} avaliações)")
-    if a.feedback_pct is not None and a.feedback_pct < 98:
-        a.alertas.append(f"feedback do vendedor {a.feedback_pct:.1f}%")
-    if a.desconto_pct >= 60:
+    avaliar_vendedor(a)
+    a.alertas.append(f"{a.nivel_vendedor} (nota {a.nota_vendedor}/100): {'; '.join(a.motivos_vendedor)}")
+    if a.desconto_pct >= DESCONTO_SUSPEITO and not a.garantia:
         a.alertas.append("desconto muito alto: confira se não é golpe ou slab falso")
     if a.fonte_mercado.startswith("mediana") and a.n_comparaveis < 6:
         a.alertas.append(f"poucos comparáveis ({a.n_comparaveis}) para o preço de mercado")
@@ -475,10 +636,16 @@ def avaliar(a: Anuncio) -> None:
 
 
 def veredito(a: Anuncio) -> str:
-    graves = [x for x in a.alertas if "golpe" in x or "pouco histórico" in x or "feedback" in x]
-    if a.desconto_pct >= 60 and graves:
+    nivel = a.nivel_vendedor
+    if nivel == NIVEL_RISCO:
         return "Provavelmente armadilha"
-    if graves or a.lucro_revenda_eua <= 0:
+    if nivel == NIVEL_FRACO:
+        if a.desconto_pct >= DESCONTO_SUSPEITO and not a.garantia:
+            return "Provavelmente armadilha"
+        return "Olhar com cautela"
+    if nivel == NIVEL_NOVO or a.lucro_revenda_eua <= 0:
+        return "Olhar com cautela"
+    if a.desconto_pct >= DESCONTO_SUSPEITO and not a.garantia:
         return "Olhar com cautela"
     return "Vale olhar"
 
@@ -532,7 +699,7 @@ def explicar_sinais(a: Anuncio) -> list[str]:
 def parecer(a: Anuncio) -> tuple[str, list[str]]:
     """Decisão (Comprar / Talvez / Não comprar) e os motivos, em linguagem simples."""
     v = veredito(a)
-    graves = [x for x in a.alertas if "golpe" in x or "pouco histórico" in x or "feedback" in x]
+    vendedor_arriscado = a.nivel_vendedor in NIVEIS_ARRISCADOS
     pct_lucro = a.lucro_revenda_eua / a.custo_total * 100 if a.custo_total else 0
     base_ok = a.fonte_mercado.startswith("PriceCharting") or a.n_comparaveis >= 6
     fortes = len(a.sinais) >= 2 or a.nota in (9, 10)
@@ -548,11 +715,16 @@ def parecer(a: Anuncio) -> tuple[str, list[str]]:
         a_favor.append("Tem bons sinais de valorização (veja abaixo).")
     if not base_ok:
         contra.append("Poucos anúncios iguais para comparar: o preço de mercado pode estar impreciso.")
-    contra += [x[0].upper() + x[1:] + "." for x in graves]
+    texto_vendedor = f"{a.nivel_vendedor} (nota {a.nota_vendedor}/100): {'; '.join(a.motivos_vendedor)}."
+    if vendedor_arriscado:
+        contra.append(texto_vendedor)
+    else:
+        a_favor.append(texto_vendedor)
     if a.pais_vendedor != "BR" and a.mercado and a.custo_brasil_usd >= a.mercado:
         contra.append("Trazendo ao Brasil, o custo passa do valor de mercado: compensa mais revender lá fora.")
 
-    if v == "Provavelmente armadilha" or a.lucro_revenda_eua <= 0 or (graves and a.desconto_pct >= 50):
+    if (v == "Provavelmente armadilha" or a.lucro_revenda_eua <= 0
+            or a.nivel_vendedor == NIVEL_RISCO or (vendedor_arriscado and a.desconto_pct >= 50)):
         decisao = "Não comprar"
     elif v == "Vale olhar" and base_ok and fortes and pct_lucro >= 15 and a.lucro_revenda_eua >= 40:
         decisao = "Comprar"
@@ -577,10 +749,12 @@ def analise_claude(a: Anuncio) -> str:
     prompt = (
         "Você ajuda um revendedor brasileiro de cartas Pokémon graduadas. Em no máximo 4 linhas, "
         "em português, diga se este anúncio do eBay parece uma boa compra para revenda, o que conferir "
-        "nas fotos/slab e o principal risco. Seja direto.\n\n"
+        "nas fotos/slab e o principal risco. Seja direto. Conta nova não é golpe por si só: "
+        "julgue o vendedor pelo conjunto.\n\n"
         f"Título: {a.titulo}\nPreço+frete: US$ {a.custo_total:.2f}\nMercado estimado: US$ {a.mercado:.2f} "
         f"({a.fonte_mercado})\nDesconto: {a.desconto_pct:.0f}%\nSinais de valorização: {', '.join(a.sinais)}\n"
-        f"Vendedor: ({a.feedback_score} avaliações, {a.feedback_pct}% positivo), país {a.pais_vendedor}"
+        f"Vendedor: {a.nivel_vendedor}, nota {a.nota_vendedor}/100 ({'; '.join(a.motivos_vendedor)}), "
+        f"país {a.pais_vendedor}"
     )
     try:
         r = requests.post(
@@ -641,7 +815,8 @@ def resumo_alerta(a: Anuncio) -> dict:
         "lucro": usd(a.lucro_revenda_eua),
         "brasil": brasil,
         "porque": ", ".join(a.sinais),
-        "vendedor": f"{a.feedback_score} avaliações · {a.feedback_pct}% positivas · {a.pais_vendedor}",
+        "vendedor": (f"{a.nivel_vendedor} · nota {a.nota_vendedor}/100 · {a.feedback_score} avaliações · "
+                     f"{a.feedback_pct}% positivas · {a.pais_vendedor}"),
         "atencao": a.alertas,
         "analise": a.analise_claude,
         "foto": link_seguro(foto_grande(a.imagem)),
@@ -688,6 +863,7 @@ def legenda_telegram(a: Anuncio) -> str:
     if r["brasil"]:
         linhas.append(f"🇧🇷 Trazendo ao Brasil: {e(r['brasil'])}")
     linhas.append(f"⭐ {e(r['porque'])}")
+    linhas.append(f"👤 {e(a.nivel_vendedor)} (nota {a.nota_vendedor}/100)")
     decisao, motivos = parecer(a)
     linhas.append(f"🧭 <b>Parecer: {e(decisao.upper())}</b>")
     graves = [x for x in r["atencao"] if "psacard" not in x]
@@ -870,7 +1046,7 @@ def linha_app(a: Anuncio) -> dict:
         "lucro_usd": round(a.lucro_revenda_eua, 2),
         "custo_brasil_usd": round(a.custo_brasil_usd, 2) if a.pais_vendedor != "BR" else None,
         "sinais": explicar_sinais(a),
-        "avisos": a.alertas,
+        "avisos": a.alertas,  # inclui o nível e a nota do vendedor
         "vendedor": None,  # não guardamos o nome de usuário (isenção do eBay)
         "vendedor_avaliacoes": a.feedback_score,
         "vendedor_positivas_pct": a.feedback_pct,
